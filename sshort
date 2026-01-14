@@ -1,0 +1,1034 @@
+#!/usr/bin/env bash
+# sshort - Short-lived SSH Certificates with YubiKey CA
+# https://github.com/USER/sshort
+#
+# Creates short-lived SSH certificates signed by a YubiKey-backed CA.
+# No server required - your YubiKey IS the CA.
+#
+# Usage: sshort [target] [+validity] [options]
+#
+# Examples:
+#   sshort                    # All targets, default validity
+#   sshort github +8h         # GitHub, 8 hours
+#   sshort +4h                # All targets, 4 hours
+
+set -euo pipefail
+
+readonly SSHORT_VERSION="0.1.0"
+readonly SSHORT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/sshort"
+readonly SSHORT_CONFIG_FILE="${SSHORT_CONFIG:-$SSHORT_CONFIG_DIR/config}"
+readonly SSHORT_KEY_DIR="${SSHORT_KEY_DIR:-$HOME/.ssh/keys}"
+readonly SSHORT_DEFAULT_VALIDITY="${SSHORT_DEFAULT_VALIDITY:-+8h}"
+readonly SSHORT_AGENT_DEFAULT=28800  # 8 hours in seconds
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+_sshort_error() {
+    echo "❌ Error: $*" >&2
+}
+
+_sshort_warn() {
+    echo "⚠️  $*" >&2
+}
+
+_sshort_info() {
+    echo "ℹ️  $*"
+}
+
+# =============================================================================
+# Configuration Parser (INI-style)
+# =============================================================================
+
+# Get a value from config file
+# Usage: _sshort_config_get "section" "key" "default"
+# For global keys, use empty section: _sshort_config_get "" "targets" ""
+_sshort_config_get() {
+    local section="$1"
+    local key="$2"
+    local default="${3:-}"
+
+    if [[ ! -f "$SSHORT_CONFIG_FILE" ]]; then
+        echo "$default"
+        return
+    fi
+
+    local result
+    if [[ -z "$section" ]]; then
+        # Global key (before any section)
+        result=$(awk -v key="$key" '
+            /^\[/ { in_section = 1 }
+            !in_section && /^[[:space:]]*'"$key"'[[:space:]]*=/ {
+                sub(/^[^=]*=[[:space:]]*/, "")
+                sub(/[[:space:]]*$/, "")
+                print
+                found = 1
+                exit
+            }
+            END { if (!found) exit 1 }
+        ' "$SSHORT_CONFIG_FILE" 2>/dev/null)
+    else
+        # Section-specific key
+        result=$(awk -v section="$section" -v key="$key" '
+            /^\['"$section"'\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && /^[[:space:]]*'"$key"'[[:space:]]*=/ {
+                sub(/^[^=]*=[[:space:]]*/, "")
+                sub(/[[:space:]]*$/, "")
+                print
+                found = 1
+                exit
+            }
+            END { if (!found) exit 1 }
+        ' "$SSHORT_CONFIG_FILE" 2>/dev/null)
+    fi
+
+    if [[ -n "$result" ]]; then
+        echo "$result"
+    else
+        echo "$default"
+    fi
+}
+
+# Get configured targets (comma-separated list)
+_sshort_get_targets() {
+    local targets
+    targets=$(_sshort_config_get "" "targets" "")
+
+    if [[ -z "$targets" ]]; then
+        _sshort_error "No targets configured."
+        echo "    Add 'targets = github, myserver' to $SSHORT_CONFIG_FILE" >&2
+        return 1
+    fi
+
+    echo "$targets"
+}
+
+# Get principals for a target
+_sshort_get_principals() {
+    local target="$1"
+    local principals
+    principals=$(_sshort_config_get "$target" "principals" "$target")
+    echo "$principals"
+}
+
+# Get certificate options for a target
+_sshort_get_options() {
+    local target="$1"
+    _sshort_config_get "$target" "options" ""
+}
+
+# Get default validity
+_sshort_get_default_validity() {
+    _sshort_config_get "" "default_validity" "$SSHORT_DEFAULT_VALIDITY"
+}
+
+# Get key directory
+_sshort_get_key_dir() {
+    local dir
+    dir=$(_sshort_config_get "" "key_dir" "$SSHORT_KEY_DIR")
+    # Expand ~ to $HOME
+    echo "${dir/#\~/$HOME}"
+}
+
+# =============================================================================
+# YubiKey Functions
+# =============================================================================
+
+# Get current YubiKey serial number
+_sshort_yubikey_get_serial() {
+    if command -v ykman >/dev/null 2>&1; then
+        ykman info 2>/dev/null | grep -o "Serial number: [0-9]*" | awk '{print $3}'
+    fi
+}
+
+# Get YubiKey device name
+_sshort_yubikey_get_name() {
+    if command -v ykman >/dev/null 2>&1; then
+        ykman list 2>/dev/null | head -1 | sed 's/ Serial:.*//'
+    fi
+}
+
+# Get CA key path for current YubiKey
+_sshort_yubikey_get_ca_key() {
+    local serial
+    serial=$(_sshort_yubikey_get_serial)
+
+    if [[ -n "$serial" ]]; then
+        local ca_key
+        ca_key=$(_sshort_config_get "yubikey:$serial" "ca_key" "")
+        if [[ -n "$ca_key" ]]; then
+            # Expand ~ to $HOME
+            echo "${ca_key/#\~/$HOME}"
+            return
+        fi
+    fi
+
+    # Fallback to default
+    local default_ca
+    default_ca=$(_sshort_config_get "" "ca_key" "$HOME/.ssh/keys/id_ed25519_sk_CA")
+    echo "${default_ca/#\~/$HOME}"
+}
+
+# Get friendly name for YubiKey
+_sshort_yubikey_get_friendly_name() {
+    local serial="${1:-$(_sshort_yubikey_get_serial)}"
+
+    if [[ -z "$serial" ]]; then
+        echo "Unknown YubiKey"
+        return
+    fi
+
+    local name
+    name=$(_sshort_config_get "yubikey:$serial" "name" "")
+
+    if [[ -n "$name" ]]; then
+        echo "$name"
+    else
+        _sshort_yubikey_get_name
+    fi
+}
+
+# =============================================================================
+# IP Detection
+# =============================================================================
+
+_sshort_get_source_ip() {
+    local ip=""
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS
+        local iface
+        iface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+        if [[ -n "$iface" ]]; then
+            ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
+        fi
+        [[ -z "$ip" ]] && ip=$(ipconfig getifaddr en0 2>/dev/null)
+        [[ -z "$ip" ]] && ip=$(ipconfig getifaddr en1 2>/dev/null)
+    else
+        # Linux
+        ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([^ ]*\).*/\1/p')
+        [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+
+    echo "$ip"
+}
+
+# =============================================================================
+# Key Path Helper
+# =============================================================================
+
+_sshort_key_path() {
+    local target="$1"
+    local key_dir
+    key_dir=$(_sshort_get_key_dir)
+    echo "$key_dir/id_ed25519_day_${target}"
+}
+
+# =============================================================================
+# Validity Conversion
+# =============================================================================
+
+_sshort_validity_to_seconds() {
+    local validity="$1"
+
+    case "$validity" in
+        +[0-9]h)
+            echo $(( ${validity:1:1} * 3600 ))
+            ;;
+        +[0-9][0-9]h|+[0-9][0-9][0-9]h)
+            local hours="${validity:1}"
+            hours="${hours%h}"
+            echo $(( hours * 3600 ))
+            ;;
+        +[0-9]m)
+            echo $(( ${validity:1:1} * 60 ))
+            ;;
+        +[0-9][0-9]m|+[0-9][0-9][0-9]m)
+            local minutes="${validity:1}"
+            minutes="${minutes%m}"
+            echo $(( minutes * 60 ))
+            ;;
+        +[0-9]s)
+            echo "${validity:1:1}"
+            ;;
+        +[0-9][0-9]s|+[0-9][0-9][0-9]s)
+            local seconds="${validity:1}"
+            echo "${seconds%s}"
+            ;;
+        [0-9]*)
+            echo "$validity"
+            ;;
+        *)
+            echo "$SSHORT_AGENT_DEFAULT"
+            ;;
+    esac
+}
+
+# =============================================================================
+# Core Commands
+# =============================================================================
+
+# Generate a new day key (passwordless)
+sshort_keygen() {
+    local target="${1:-generic}"
+    local key_path
+    key_path=$(_sshort_key_path "$target")
+    local key_date
+    key_date=$(date +%Y%m%d-%H%M)
+
+    # Ensure key directory exists
+    local key_dir
+    key_dir=$(_sshort_get_key_dir)
+    mkdir -p "$key_dir"
+
+    if [[ -f "$key_path" && -f "${key_path}.pub" ]]; then
+        echo "⚠️  Key already exists at $key_path; skipping generation"
+        return 0
+    fi
+
+    echo "🔑 Generating new day key at $key_path"
+    ssh-keygen -t ed25519 -f "$key_path" -C "sshort-$target-$key_date" -N ""
+    chmod 600 "$key_path" "${key_path}.pub"
+    echo "✅ Day key generated: ${key_path}.pub"
+}
+
+# Sign day key with YubiKey CA
+sshort_sign() {
+    local target="${1:-all}"
+    local validity
+    validity=$(_sshort_get_default_validity)
+    local validity_provided=0
+    local override_principals=""
+    local key_date
+    key_date=$(date +%Y%m%d-%H%M)
+    local cli_options=()
+    local auto_source_ip=0
+
+    # Parse arguments
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            +[0-9]*[hms])
+                validity="$1"
+                validity_provided=1
+                ;;
+            --principal=*)
+                override_principals="${1#--principal=}"
+                ;;
+            -p=*)
+                override_principals="${1#-p=}"
+                ;;
+            --option=*)
+                cli_options+=("${1#--option=}")
+                ;;
+            -O)
+                shift
+                [[ $# -gt 0 ]] && cli_options+=("$1")
+                ;;
+            -O=*)
+                cli_options+=("${1#-O=}")
+                ;;
+            -O*)
+                cli_options+=("${1#-O}")
+                ;;
+            --source-ip|--auto-ip|-S)
+                auto_source_ip=1
+                ;;
+            *)
+                # Unknown argument, might be another target
+                ;;
+        esac
+        shift
+    done
+
+    # Auto-detect source IP if requested
+    if [[ $auto_source_ip -eq 1 ]]; then
+        local current_ip
+        current_ip=$(_sshort_get_source_ip)
+        if [[ -n "$current_ip" ]]; then
+            cli_options+=("source-address=${current_ip}/32")
+        else
+            _sshort_warn "Could not detect source IP, skipping source-address option"
+        fi
+    fi
+
+    # Handle 'all' target
+    if [[ "$target" == "all" ]]; then
+        local targets
+        targets=$(_sshort_get_targets) || return 1
+        local t
+        echo "$targets" | tr ',' '\n' | while read -r t; do
+            t=$(echo "$t" | xargs)  # trim whitespace
+            [[ -z "$t" ]] && continue
+            sshort_sign "$t" "$validity" || return 1
+            echo ""
+        done
+        return 0
+    fi
+
+    # Get key path and principals
+    local key_path
+    key_path=$(_sshort_key_path "$target")
+
+    local principals
+    if [[ -n "$override_principals" ]]; then
+        principals="$override_principals"
+    else
+        principals=$(_sshort_get_principals "$target")
+    fi
+
+    local key_id="${target}-sshort-$key_date"
+
+    # Generate key if needed
+    sshort_keygen "$target"
+
+    # Get YubiKey info
+    local yubikey_serial
+    yubikey_serial=$(_sshort_yubikey_get_serial)
+    local yubikey_name
+    yubikey_name=$(_sshort_yubikey_get_friendly_name "$yubikey_serial")
+    local ca_key
+    ca_key=$(_sshort_yubikey_get_ca_key)
+
+    # Merge config options with CLI options
+    local config_options
+    config_options=$(_sshort_get_options "$target")
+    local all_options=()
+
+    if [[ -n "$config_options" ]]; then
+        for opt in $config_options; do
+            all_options+=("$opt")
+        done
+    fi
+
+    for opt in "${cli_options[@]}"; do
+        all_options+=("$opt")
+    done
+
+    echo "🔐 Signing $target day key with YubiKey CA..."
+    if [[ -n "$yubikey_serial" ]]; then
+        echo "   YubiKey: $yubikey_name (Serial: $yubikey_serial)"
+    fi
+    echo "   CA Key: $ca_key"
+    echo "   Day Key: $key_path"
+    echo "   Validity: $validity"
+    echo "   Principal: $principals"
+    if [[ ${#all_options[@]} -gt 0 ]]; then
+        echo "   Options: ${all_options[*]}"
+    fi
+    echo "👆 Touch YubiKey when it blinks..."
+
+    # Build ssh-keygen command
+    local keygen_cmd=(ssh-keygen -s "$ca_key" -I "$key_id" -n "$principals" -V "$validity")
+    for opt in "${all_options[@]}"; do
+        keygen_cmd+=(-O "$opt")
+    done
+    keygen_cmd+=("${key_path}.pub")
+
+    if "${keygen_cmd[@]}"; then
+        echo "✅ Certificate created: ${key_path}-cert.pub"
+        echo "   Valid for: $validity from now"
+        echo "   Principal: $principals"
+        if [[ ${#all_options[@]} -gt 0 ]]; then
+            echo "   Options: ${all_options[*]}"
+        fi
+        if [[ -n "$yubikey_serial" ]]; then
+            echo "   Signed by: $yubikey_name"
+        fi
+    else
+        _sshort_error "Failed to sign certificate"
+        return 1
+    fi
+}
+
+# Add day key to SSH agent
+sshort_add() {
+    local target="${1:-all}"
+    local validity="${2:-$(_sshort_get_default_validity)}"
+    local timeout
+    timeout=$(_sshort_validity_to_seconds "$validity")
+    [[ -z "$timeout" ]] && timeout=$SSHORT_AGENT_DEFAULT
+
+    # Handle 'all' target
+    if [[ "$target" == "all" ]]; then
+        local targets
+        targets=$(_sshort_get_targets) || return 1
+        local t
+        echo "$targets" | tr ',' '\n' | while read -r t; do
+            t=$(echo "$t" | xargs)
+            [[ -z "$t" ]] && continue
+            sshort_add "$t" "$validity" || return 1
+        done
+        return 0
+    fi
+
+    local key_path
+    key_path=$(_sshort_key_path "$target")
+
+    if [[ ! -f "${key_path}-cert.pub" ]]; then
+        _sshort_error "Certificate not found at ${key_path}-cert.pub"
+        echo "   Run: sshort sign $target" >&2
+        return 1
+    fi
+
+    echo "🔓 Adding $target day key to SSH agent (timeout: ${timeout}s)..."
+    if ssh-add -t "$timeout" "$key_path"; then
+        echo "✅ $target day key added to agent"
+        ssh-add -l | grep "$key_path" || true
+    else
+        _sshort_error "Failed to add key to agent"
+        return 1
+    fi
+}
+
+# Complete setup: generate, sign, add
+sshort_setup() {
+    local target="${1:-all}"
+    local validity
+    validity=$(_sshort_get_default_validity)
+    local extra_args=()
+
+    # Parse arguments
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            +[0-9]*[hms])
+                validity="$1"
+                ;;
+            *)
+                extra_args+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    echo "🚀 Complete day key setup for: $target (validity: $validity)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    sshort_sign "$target" "$validity" "${extra_args[@]}" || return 1
+    echo ""
+    sshort_add "$target" "$validity" || return 1
+    echo ""
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✨ Day key setup complete!"
+    echo "   Test with: ssh -T <your-target>"
+}
+
+# =============================================================================
+# Status and Cleanup Commands
+# =============================================================================
+
+sshort_status() {
+    local target="${1:-all}"
+    local key_dir
+    key_dir=$(_sshort_get_key_dir)
+
+    echo "📋 sshort Certificate Status"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    if [[ "$target" == "all" ]]; then
+        local targets
+        targets=$(_sshort_get_targets) || return 1
+        echo "$targets" | tr ',' '\n' | while read -r t; do
+            t=$(echo "$t" | xargs)
+            [[ -z "$t" ]] && continue
+            _sshort_status_target "$t"
+            echo ""
+        done
+    else
+        _sshort_status_target "$target"
+    fi
+}
+
+_sshort_status_target() {
+    local target="$1"
+    local key_path
+    key_path=$(_sshort_key_path "$target")
+    local cert_path="${key_path}-cert.pub"
+
+    echo "🎯 Target: $target"
+
+    if [[ ! -f "$cert_path" ]]; then
+        echo "   Status: ❌ No certificate"
+        return
+    fi
+
+    # Parse certificate details
+    local cert_info
+    cert_info=$(ssh-keygen -L -f "$cert_path" 2>/dev/null)
+
+    local valid_line
+    valid_line=$(echo "$cert_info" | grep "Valid:")
+
+    if [[ -n "$valid_line" ]]; then
+        echo "   $valid_line"
+
+        # Check if expired
+        local to_date
+        to_date=$(echo "$valid_line" | sed 's/.*to //')
+        local to_epoch
+        to_epoch=$(date -d "$to_date" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "$to_date" +%s 2>/dev/null)
+        local now_epoch
+        now_epoch=$(date +%s)
+
+        if [[ -n "$to_epoch" && $now_epoch -gt $to_epoch ]]; then
+            echo "   Status: ⏰ EXPIRED"
+        else
+            echo "   Status: ✅ Valid"
+        fi
+    fi
+
+    local principals_line
+    principals_line=$(echo "$cert_info" | grep "Principals:")
+    [[ -n "$principals_line" ]] && echo "   $principals_line"
+}
+
+sshort_clean() {
+    local target="${1:-all}"
+    local dry_run=0
+    local remove_all=0
+
+    # Parse flags
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run|-n) dry_run=1 ;;
+            --all|-a) remove_all=1 ;;
+        esac
+    done
+
+    echo "🧹 Cleaning sshort certificates..."
+
+    local key_dir
+    key_dir=$(_sshort_get_key_dir)
+
+    if [[ "$target" == "all" ]]; then
+        local targets
+        targets=$(_sshort_get_targets) || return 1
+        echo "$targets" | tr ',' '\n' | while read -r t; do
+            t=$(echo "$t" | xargs)
+            [[ -z "$t" ]] && continue
+            _sshort_clean_target "$t" "$dry_run" "$remove_all"
+        done
+    else
+        _sshort_clean_target "$target" "$dry_run" "$remove_all"
+    fi
+}
+
+_sshort_clean_target() {
+    local target="$1"
+    local dry_run="$2"
+    local remove_all="$3"
+    local key_path
+    key_path=$(_sshort_key_path "$target")
+
+    if [[ ! -f "${key_path}-cert.pub" ]]; then
+        return
+    fi
+
+    local should_remove=0
+
+    if [[ $remove_all -eq 1 ]]; then
+        should_remove=1
+    else
+        # Check if expired
+        local cert_info
+        cert_info=$(ssh-keygen -L -f "${key_path}-cert.pub" 2>/dev/null)
+        local valid_line
+        valid_line=$(echo "$cert_info" | grep "Valid:")
+        local to_date
+        to_date=$(echo "$valid_line" | sed 's/.*to //')
+        local to_epoch
+        to_epoch=$(date -d "$to_date" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "$to_date" +%s 2>/dev/null)
+        local now_epoch
+        now_epoch=$(date +%s)
+
+        if [[ -n "$to_epoch" && $now_epoch -gt $to_epoch ]]; then
+            should_remove=1
+        fi
+    fi
+
+    if [[ $should_remove -eq 1 ]]; then
+        if [[ $dry_run -eq 1 ]]; then
+            echo "   Would remove: $target (${key_path}*)"
+        else
+            rm -f "$key_path" "${key_path}.pub" "${key_path}-cert.pub"
+            echo "   Removed: $target"
+        fi
+    fi
+}
+
+# =============================================================================
+# YubiKey Management Commands
+# =============================================================================
+
+sshort_yubikey_list() {
+    echo "🔑 YubiKey Configuration"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local serial
+    serial=$(_sshort_yubikey_get_serial)
+
+    if [[ -n "$serial" ]]; then
+        local name
+        name=$(_sshort_yubikey_get_friendly_name "$serial")
+        local ca_key
+        ca_key=$(_sshort_yubikey_get_ca_key)
+
+        echo "📍 Connected YubiKey:"
+        echo "   Name: $name"
+        echo "   Serial: $serial"
+        echo "   CA Key: $ca_key"
+
+        if [[ -f "$ca_key.pub" ]]; then
+            echo "   CA Status: ✅ Found"
+        else
+            echo "   CA Status: ❌ Not found at $ca_key.pub"
+        fi
+    else
+        echo "❌ No YubiKey detected"
+        echo "   Insert a YubiKey and try again"
+    fi
+}
+
+# =============================================================================
+# Configuration Commands
+# =============================================================================
+
+sshort_config() {
+    local subcmd="${1:-show}"
+
+    case "$subcmd" in
+        show)
+            echo "📝 sshort Configuration"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Config file: $SSHORT_CONFIG_FILE"
+            echo ""
+            if [[ -f "$SSHORT_CONFIG_FILE" ]]; then
+                cat "$SSHORT_CONFIG_FILE"
+            else
+                echo "(No config file found)"
+                echo ""
+                echo "Create one with: sshort config init"
+            fi
+            ;;
+        edit)
+            ${EDITOR:-vi} "$SSHORT_CONFIG_FILE"
+            ;;
+        init)
+            if [[ -f "$SSHORT_CONFIG_FILE" ]]; then
+                echo "Config already exists at $SSHORT_CONFIG_FILE"
+                return 1
+            fi
+            mkdir -p "$SSHORT_CONFIG_DIR"
+            cat > "$SSHORT_CONFIG_FILE" << 'EOF'
+# sshort configuration
+# https://github.com/USER/sshort
+
+# Targets to manage (comma-separated)
+targets = github
+
+# Default certificate validity
+default_validity = +8h
+
+# Where to store day keys
+key_dir = ~/.ssh/keys
+
+# Default CA key (if not specified per-YubiKey)
+ca_key = ~/.ssh/keys/id_ed25519_sk_CA
+
+# Target-specific settings
+[github]
+principals = git
+
+# Example: server with IP restriction
+# [myserver]
+# principals = myuser
+# options = source-address=10.0.0.0/8
+
+# YubiKey configuration (by serial number)
+# Find serial with: ykman info
+# [yubikey:12345678]
+# name = My YubiKey
+# ca_key = ~/.ssh/keys/id_ed25519_sk_CA
+EOF
+            echo "✅ Created config at $SSHORT_CONFIG_FILE"
+            echo "   Edit with: sshort config edit"
+            ;;
+        *)
+            _sshort_error "Unknown config command: $subcmd"
+            echo "   Available: show, edit, init"
+            return 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# Doctor Command
+# =============================================================================
+
+sshort_doctor() {
+    echo "🏥 sshort Doctor"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    local errors=0
+
+    # Check dependencies
+    echo ""
+    echo "Dependencies:"
+    for cmd in ssh-keygen ssh-add ykman; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "   ✅ $cmd: $(command -v "$cmd")"
+        else
+            echo "   ❌ $cmd: NOT FOUND"
+            errors=$((errors + 1))
+        fi
+    done
+
+    # Check config
+    echo ""
+    echo "Configuration:"
+    if [[ -f "$SSHORT_CONFIG_FILE" ]]; then
+        echo "   ✅ Config: $SSHORT_CONFIG_FILE"
+        local targets
+        targets=$(_sshort_get_targets 2>/dev/null) || targets=""
+        if [[ -n "$targets" ]]; then
+            echo "   ✅ Targets: $targets"
+        else
+            echo "   ⚠️  No targets configured"
+        fi
+    else
+        echo "   ⚠️  No config file (run: sshort config init)"
+    fi
+
+    # Check YubiKey
+    echo ""
+    echo "YubiKey:"
+    local serial
+    serial=$(_sshort_yubikey_get_serial)
+    if [[ -n "$serial" ]]; then
+        echo "   ✅ Connected: $(_sshort_yubikey_get_friendly_name "$serial") ($serial)"
+        local ca_key
+        ca_key=$(_sshort_yubikey_get_ca_key)
+        if [[ -f "$ca_key.pub" ]]; then
+            echo "   ✅ CA Key: $ca_key"
+        else
+            echo "   ❌ CA Key not found: $ca_key"
+            errors=$((errors + 1))
+        fi
+    else
+        echo "   ⚠️  No YubiKey detected"
+    fi
+
+    # Check key directory
+    echo ""
+    echo "Key Storage:"
+    local key_dir
+    key_dir=$(_sshort_get_key_dir)
+    if [[ -d "$key_dir" ]]; then
+        echo "   ✅ Key directory: $key_dir"
+    else
+        echo "   ⚠️  Key directory doesn't exist: $key_dir"
+        echo "      (Will be created on first use)"
+    fi
+
+    # Summary
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [[ $errors -eq 0 ]]; then
+        echo "✅ All checks passed!"
+    else
+        echo "❌ $errors error(s) found"
+        return 1
+    fi
+}
+
+# =============================================================================
+# Help and Shell Init
+# =============================================================================
+
+sshort_help() {
+    cat << 'EOF'
+sshort - Short-lived SSH Certificates with YubiKey CA
+
+USAGE:
+    sshort [target] [+validity] [options]
+    sshort <command> [args]
+
+QUICK START:
+    sshort                      # All targets, default validity
+    sshort github +8h           # GitHub, 8 hours
+    sshort +4h                  # All targets, 4 hours
+
+COMMANDS:
+    (default)           Create certificates (sign + add to agent)
+    status [target]     Show certificate status
+    clean [--all]       Remove expired certificates (--all = all certs)
+    remove <target>     Remove specific certificate
+
+    yubikey list        Show YubiKey configuration
+    yubikey setup-ca    Create CA key on YubiKey (not yet implemented)
+
+    config show         Show current configuration
+    config edit         Open config in $EDITOR
+    config init         Create default config file
+
+    doctor              Check setup and diagnose issues
+    help                Show this help
+    version             Show version
+    commands            List all commands
+    shell-init          Output shell integration code
+
+OPTIONS:
+    -O, --option=OPT    Add certificate option (e.g., source-address=10.0.0.0/8)
+    -S, --source-ip     Auto-detect current IP for source-address
+    --principal=NAME    Override principal for signing
+
+EXAMPLES:
+    sshort github +4h                     # 4-hour GitHub certificate
+    sshort myserver +12h -S               # 12h cert with current IP restriction
+    sshort +8h -O no-port-forwarding      # All targets, no port forwarding
+
+CONFIG FILE:
+    ~/.config/sshort/config
+
+    targets = github, myserver
+    default_validity = +8h
+
+    [github]
+    principals = git
+
+    [myserver]
+    principals = admin
+    options = source-address=10.0.0.0/8
+
+More info: https://github.com/USER/sshort
+EOF
+}
+
+sshort_commands() {
+    cat << 'EOF'
+sshort commands:
+
+  Main:
+    sshort [target] [+validity]    Create certificate (default command)
+    sshort status [target]         Show certificate status
+    sshort clean [--all]           Remove expired certificates
+    sshort remove <target>         Remove specific certificate
+
+  YubiKey:
+    sshort yubikey list            Show YubiKey configuration
+
+  Configuration:
+    sshort config show             Show current config
+    sshort config edit             Edit config file
+    sshort config init             Create default config
+
+  Utilities:
+    sshort doctor                  Diagnose setup issues
+    sshort help                    Show help
+    sshort version                 Show version
+    sshort commands                This list
+    sshort shell-init              Shell integration
+EOF
+}
+
+sshort_shell_init() {
+    cat << 'EOF'
+# sshort shell integration
+# Add to ~/.bashrc or ~/.zshrc:
+#   eval "$(sshort shell-init)"
+
+alias sshcerts='sshort status'
+alias sshort-4h='sshort +4h'
+alias sshort-8h='sshort +8h'
+alias sshort-12h='sshort +12h'
+alias sshort-24h='sshort +24h'
+EOF
+}
+
+sshort_version() {
+    echo "sshort $SSHORT_VERSION"
+}
+
+# =============================================================================
+# Main Router
+# =============================================================================
+
+main() {
+    local cmd="${1:-}"
+
+    # Handle empty or validity-first invocation
+    if [[ -z "$cmd" ]]; then
+        sshort_setup all
+        return
+    fi
+
+    # Check if first arg is a validity pattern
+    if [[ "$cmd" =~ ^\+[0-9]+[hms]$ ]]; then
+        sshort_setup all "$@"
+        return
+    fi
+
+    # Route commands
+    case "$cmd" in
+        help|--help|-h)
+            sshort_help
+            ;;
+        version|--version|-v)
+            sshort_version
+            ;;
+        commands)
+            sshort_commands
+            ;;
+        shell-init)
+            sshort_shell_init
+            ;;
+        status|st)
+            shift
+            sshort_status "$@"
+            ;;
+        clean|cleanup)
+            shift
+            sshort_clean "$@"
+            ;;
+        remove|rm)
+            shift
+            sshort_clean --all "$@"
+            ;;
+        config)
+            shift
+            sshort_config "$@"
+            ;;
+        doctor)
+            sshort_doctor
+            ;;
+        yubikey|yk)
+            shift
+            local subcmd="${1:-list}"
+            case "$subcmd" in
+                list|ls) sshort_yubikey_list ;;
+                *) _sshort_error "Unknown yubikey command: $subcmd" ;;
+            esac
+            ;;
+        sign)
+            shift
+            sshort_sign "$@"
+            ;;
+        add)
+            shift
+            sshort_add "$@"
+            ;;
+        keygen)
+            shift
+            sshort_keygen "$@"
+            ;;
+        *)
+            # Assume it's a target
+            sshort_setup "$@"
+            ;;
+    esac
+}
+
+main "$@"

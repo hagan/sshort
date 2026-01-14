@@ -1,0 +1,12 @@
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Testing
+test-output/
