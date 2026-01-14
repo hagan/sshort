@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sshort - Short-lived SSH Certificates with YubiKey CA
-# https://github.com/USER/sshort
+# https://github.com/hagan/sshort
 #
 # Creates short-lived SSH certificates signed by a YubiKey-backed CA.
 # No server required - your YubiKey IS the CA.
@@ -725,7 +725,7 @@ sshort_config() {
             mkdir -p "$SSHORT_CONFIG_DIR"
             cat > "$SSHORT_CONFIG_FILE" << 'EOF'
 # sshort configuration
-# https://github.com/USER/sshort
+# https://github.com/hagan/sshort
 
 # Targets to manage (comma-separated)
 targets = github
@@ -903,7 +903,7 @@ CONFIG FILE:
     principals = admin
     options = source-address=10.0.0.0/8
 
-More info: https://github.com/USER/sshort
+More info: https://github.com/hagan/sshort
 EOF
 }
 

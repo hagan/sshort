@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # sshort installer
-# https://github.com/USER/sshort
+# https://github.com/hagan/sshort
 
 set -euo pipefail
 
 INSTALL_DIR="${SSHORT_INSTALL_DIR:-$HOME/.local/bin}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/sshort"
-REPO_URL="https://raw.githubusercontent.com/USER/sshort/main"
+REPO_URL="https://raw.githubusercontent.com/hagan/sshort/main"
 
 echo "🔐 Installing sshort..."
 echo ""
