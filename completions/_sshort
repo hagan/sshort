@@ -1,0 +1,111 @@
+#compdef sshort
+
+# sshort zsh completion
+# Place in $fpath (e.g., ~/.zsh/completions/) or source directly
+
+_sshort_targets() {
+    local targets
+    if command -v sshort >/dev/null 2>&1; then
+        targets=(${(s:,:)$(sshort config show 2>/dev/null | grep "^targets" | sed 's/.*= *//')})
+        _describe 'target' targets
+    fi
+}
+
+_sshort_validity() {
+    local validities=(
+        '+1h:1 hour'
+        '+2h:2 hours'
+        '+4h:4 hours'
+        '+8h:8 hours (default)'
+        '+12h:12 hours'
+        '+24h:24 hours'
+    )
+    _describe 'validity' validities
+}
+
+_sshort_cert_options() {
+    local options=(
+        'source-address=:Restrict to source IP/CIDR'
+        'no-port-forwarding:Disable port forwarding'
+        'no-agent-forwarding:Disable agent forwarding'
+        'no-x11-forwarding:Disable X11 forwarding'
+        'no-pty:Disable PTY allocation'
+        'force-command=:Force specific command'
+    )
+    _describe 'certificate option' options
+}
+
+_sshort() {
+    local -a commands
+    commands=(
+        'status:Show certificate status'
+        'clean:Remove expired certificates'
+        'remove:Remove specific certificate'
+        'config:Configuration management'
+        'yubikey:YubiKey management'
+        'doctor:Diagnose setup issues'
+        'help:Show help'
+        'version:Show version'
+        'commands:List all commands'
+        'shell-init:Output shell integration'
+        'sign:Sign day key (without adding to agent)'
+        'add:Add day key to agent'
+        'keygen:Generate day key only'
+    )
+
+    local -a config_commands
+    config_commands=(
+        'show:Show current configuration'
+        'edit:Edit configuration file'
+        'init:Create default configuration'
+    )
+
+    local -a yubikey_commands
+    yubikey_commands=(
+        'list:Show YubiKey configuration'
+    )
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[Show help]' \
+        '(-v --version)'{-v,--version}'[Show version]' \
+        '(-O --option)'{-O,--option}'[Certificate option]:option:_sshort_cert_options' \
+        '(-S --source-ip)'{-S,--source-ip}'[Auto-detect source IP]' \
+        '--principal=[Override principal]:principal:' \
+        '1: :->first' \
+        '2: :->second' \
+        '*: :->rest'
+
+    case "$state" in
+        first)
+            _alternative \
+                'commands:command:((${(kv)commands}))' \
+                'targets:target:_sshort_targets' \
+                'validity:validity:_sshort_validity'
+            ;;
+        second)
+            case "${words[2]}" in
+                config)
+                    _describe 'config command' config_commands
+                    ;;
+                yubikey|yk)
+                    _describe 'yubikey command' yubikey_commands
+                    ;;
+                status|st|clean|remove|rm|sign|add|keygen)
+                    _alternative \
+                        'targets:target:_sshort_targets' \
+                        'all:all:(all)'
+                    ;;
+                *)
+                    _sshort_validity
+                    ;;
+            esac
+            ;;
+        rest)
+            _alternative \
+                'validity:validity:_sshort_validity' \
+                'options:option:((-O --option -S --source-ip))'
+            ;;
+    esac
+}
+
+_sshort "$@"
