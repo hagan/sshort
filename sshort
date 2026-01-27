@@ -935,17 +935,53 @@ EOF
 }
 
 sshort_shell_init() {
+    # Detect shell
+    local shell_name
+    shell_name=$(basename "${SHELL:-bash}")
+
     cat << 'EOF'
 # sshort shell integration
 # Add to ~/.bashrc or ~/.zshrc:
 #   eval "$(sshort shell-init)"
 
+# Convenience aliases
 alias sshcerts='sshort status'
 alias sshort-4h='sshort +4h'
 alias sshort-8h='sshort +8h'
 alias sshort-12h='sshort +12h'
 alias sshort-24h='sshort +24h'
 EOF
+
+    # Source completions based on shell
+    local sshort_dir
+    sshort_dir=$(dirname "$(command -v sshort 2>/dev/null || echo "$0")")
+
+    # Check common completion locations
+    local completion_dirs=(
+        "${sshort_dir}/../share/sshort/completions"
+        "${sshort_dir}/completions"
+        "${HOME}/.local/share/sshort/completions"
+        "/usr/local/share/sshort/completions"
+    )
+
+    case "$shell_name" in
+        bash)
+            for dir in "${completion_dirs[@]}"; do
+                if [[ -r "${dir}/sshort.bash" ]]; then
+                    echo "source \"${dir}/sshort.bash\""
+                    return
+                fi
+            done
+            ;;
+        zsh)
+            for dir in "${completion_dirs[@]}"; do
+                if [[ -d "$dir" ]] && [[ -r "${dir}/_sshort" ]]; then
+                    echo "fpath=(\"${dir}\" \$fpath)"
+                    return
+                fi
+            done
+            ;;
+    esac
 }
 
 sshort_version() {
