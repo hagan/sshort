@@ -1001,9 +1001,9 @@ sshort_version() {
 main() {
     local cmd="${1:-}"
 
-    # Handle empty or validity-first invocation
+    # Handle empty invocation - show status or help
     if [[ -z "$cmd" ]]; then
-        sshort_setup all
+        sshort_status
         return
     fi
 
