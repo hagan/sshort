@@ -953,8 +953,14 @@ alias sshort-24h='sshort +24h'
 EOF
 
     # Source completions based on shell
-    local sshort_dir
-    sshort_dir=$(dirname "$(command -v sshort 2>/dev/null || echo "$0")")
+    # Resolve symlinks to find the actual sshort directory
+    local sshort_bin sshort_dir
+    sshort_bin=$(command -v sshort 2>/dev/null || echo "$0")
+    # Follow symlinks if readlink is available
+    if command -v readlink >/dev/null 2>&1; then
+        sshort_bin=$(readlink -f "$sshort_bin" 2>/dev/null || echo "$sshort_bin")
+    fi
+    sshort_dir=$(dirname "$sshort_bin")
 
     # Check common completion locations
     local completion_dirs=(
