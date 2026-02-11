@@ -38,6 +38,7 @@ _sshort_cert_options() {
 _sshort() {
     local -a commands
     commands=(
+        'init:First-time setup - extract CA from YubiKey'
         'status:Show certificate status'
         'clean:Remove expired certificates'
         'remove:Remove specific certificate'

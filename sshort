@@ -769,6 +769,115 @@ EOF
 # Doctor Command
 # =============================================================================
 
+sshort_init() {
+    echo "🔧 sshort Initial Setup"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local key_dir ca_key
+    key_dir=$(_sshort_get_key_dir)
+    ca_key=$(_sshort_get_config_value "" "ca_key" "$key_dir/id_ed25519_sk_CA")
+    ca_key=$(eval echo "$ca_key")  # Expand ~
+
+    # Check if CA already exists
+    if [[ -f "$ca_key" ]] && [[ -f "$ca_key.pub" ]]; then
+        echo "✅ CA key already exists at: $ca_key"
+        echo ""
+        echo "CA public key:"
+        cat "$ca_key.pub"
+        echo ""
+        read -rp "Overwrite existing CA? [y/N] " confirm
+        if [[ ! "$confirm" =~ ^[Yy] ]]; then
+            echo "Aborted."
+            return 0
+        fi
+    fi
+
+    # Create key directory
+    mkdir -p "$key_dir"
+    chmod 700 "$key_dir"
+
+    echo ""
+    echo "📥 Extracting resident keys from YubiKey..."
+    echo "   Touch YubiKey when it blinks..."
+    echo ""
+
+    # Create temp directory for extraction
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" EXIT
+
+    # Extract resident keys
+    if ! (cd "$tmpdir" && ssh-keygen -K 2>&1); then
+        _sshort_error "Failed to extract keys from YubiKey"
+        _sshort_error "Make sure your YubiKey is plugged in and has resident SSH keys"
+        return 1
+    fi
+
+    # Find extracted keys
+    local keys=()
+    for f in "$tmpdir"/id_*_sk_rk*; do
+        [[ -f "$f" ]] && [[ ! "$f" =~ \.pub$ ]] && keys+=("$f")
+    done
+
+    if [[ ${#keys[@]} -eq 0 ]]; then
+        _sshort_error "No resident SSH keys found on YubiKey"
+        _sshort_error "Create one with: ssh-keygen -t ed25519-sk -O resident -O application=ssh:mykey"
+        return 1
+    fi
+
+    echo ""
+    echo "Found ${#keys[@]} resident key(s):"
+    echo ""
+
+    local selected_key=""
+    if [[ ${#keys[@]} -eq 1 ]]; then
+        selected_key="${keys[0]}"
+        echo "   $(basename "$selected_key")"
+        echo "   $(cat "${selected_key}.pub")"
+    else
+        # Multiple keys - let user choose
+        local i=1
+        for key in "${keys[@]}"; do
+            echo "   [$i] $(basename "$key")"
+            echo "       $(cat "${key}.pub" | cut -c1-80)..."
+            i=$((i + 1))
+        done
+        echo ""
+        read -rp "Select key to use as CA [1-${#keys[@]}]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#keys[@]} ]]; then
+            selected_key="${keys[$((choice - 1))]}"
+        else
+            _sshort_error "Invalid selection"
+            return 1
+        fi
+    fi
+
+    echo ""
+    echo "📁 Installing CA key to: $ca_key"
+
+    # Move key to CA location
+    mv "$selected_key" "$ca_key"
+    mv "${selected_key}.pub" "${ca_key}.pub"
+    chmod 600 "$ca_key"
+    chmod 644 "${ca_key}.pub"
+
+    echo "✅ CA key installed"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✨ Setup complete!"
+    echo ""
+    echo "Your CA public key (add to servers' TrustedUserCAKeys):"
+    echo ""
+    cat "${ca_key}.pub"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Configure targets: sshort config edit"
+    echo "  2. Generate a day key: sshort <target>"
+    echo "  3. Check status: sshort"
+}
+
+# =============================================================================
+
 sshort_doctor() {
     echo "🏥 sshort Doctor"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -857,18 +966,20 @@ USAGE:
     sshort <command> [args]
 
 QUICK START:
-    sshort                      # All targets, default validity
+    sshort init                 # First-time setup: extract CA from YubiKey
     sshort github +8h           # GitHub, 8 hours
     sshort +4h                  # All targets, 4 hours
+    sshort                      # Show certificate status
 
 COMMANDS:
-    (default)           Create certificates (sign + add to agent)
+    init                Extract CA key from YubiKey (first-time setup)
+    (no args)           Show certificate status
+    <target> [+validity] Create certificate for target
     status [target]     Show certificate status
     clean [--all]       Remove expired certificates (--all = all certs)
     remove <target>     Remove specific certificate
 
     yubikey list        Show YubiKey configuration
-    yubikey setup-ca    Create CA key on YubiKey (not yet implemented)
 
     config show         Show current configuration
     config edit         Open config in $EDITOR
@@ -1045,6 +1156,9 @@ main() {
             ;;
         doctor)
             sshort_doctor
+            ;;
+        init)
+            sshort_init
             ;;
         yubikey|yk)
             shift

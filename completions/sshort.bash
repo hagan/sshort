@@ -5,7 +5,7 @@ _sshort_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="status clean remove config yubikey doctor help version commands shell-init sign add keygen"
+    local commands="init status clean remove config yubikey doctor help version commands shell-init sign add keygen"
     local config_commands="show edit init"
     local yubikey_commands="list"
     local validity_options="+1h +2h +4h +8h +12h +24h"
