@@ -10,3 +10,15 @@
 
 # Testing
 test-output/
+
+# Key material - defense in depth.
+# sshort reads keys from $SSHORT_KEY_DIR (default ~/.ssh/keys) and config from
+# $SSHORT_CONFIG_DIR, both outside this repo, so nothing should ever land here.
+# These patterns exist to catch a stray run with SSHORT_KEY_DIR=. during
+# development, which would otherwise drop private keys into the working tree.
+id_*
+*.pub
+*-cert.pub
+*.pem
+*.key
+known_hosts*
